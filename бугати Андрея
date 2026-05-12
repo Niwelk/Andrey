@@ -1,0 +1,105 @@
+import requests
+from django.shortcuts import render
+from django.conf import settings
+from .models import Game, Achievement
+
+API_KEY = settings.STEAM_API_KEY
+
+def index(request):
+    query = request.GET.get('query')
+    games = []
+    if query:
+        # Поиск игр через Steam API
+        url = "https://store.steampowered.com/api/storesearch/"
+        params = {"term": query, "l": "russian", "cc": "RU"}
+        try:
+            response = requests.get(url, params=params, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                for item in data.get("items", []):
+                    games.append({
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "image": item.get("tiny_image")
+                    })
+        except Exception as e:
+            print(f"Search error: {e}")
+            
+    return render(request, 'games/index.html', {'games': games})
+
+def game_detail(request, game_id):
+    # Страница "О игре" (Страница 2 из PDF)
+    url = "https://store.steampowered.com/api/appdetails/"
+    params = {"appids": game_id, "l": "russian"}
+    game_data = {}
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        if data.get(str(game_id), {}).get("success"):
+            raw_data = data[str(game_id)]["data"]
+            game_data = {
+                "steam_id": game_id,
+                "name": raw_data.get("name"),
+                "description": raw_data.get("short_description"),
+                "image": raw_data.get("header_image"),
+                "price": raw_data.get("price_overview", {}).get("final_formatted", "Бесплатно")
+            }
+            # Сохраняем/обновляем в базе
+            Game.objects.update_or_create(
+                steam_id=game_id,
+                defaults={"name": game_data["name"], "image": game_data["image"]}
+            )
+    except Exception as e:
+        print(f"Detail error: {e}")
+
+    return render(request, 'games/game_detail.html', {'game': game_data})
+
+def get_achievements(request, game_id):
+    # Страница достижений (Страница 3 из PDF)
+    game_instance = Game.objects.filter(steam_id=game_id).first()
+    result = []
+    try:
+        # Проценты редкости
+        p_url = "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/"
+        p_res = requests.get(p_url, params={"gameid": game_id})
+        p_dict = {a["name"]: a["percent"] for a in p_res.json()["achievementpercentages"]["achievements"]}
+
+        # Схема (названия и иконки)
+        s_url = "https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/"
+        s_res = requests.get(s_url, params={"appid": game_id, "key": API_KEY})
+        s_data = s_res.json().get("game", {}).get("availableGameStats", {}).get("achievements", [])
+
+        for ach in s_data:
+            api_name = ach.get("name")
+            rarity = p_dict.get(api_name, 0.0)
+            
+            achievement_obj, _ = Achievement.objects.update_or_create(
+                game=game_instance,
+                api_name=api_name,
+                defaults={
+                    'display_name': ach.get("displayName"),
+                    'description': ach.get("description", "Условие скрыто"),
+                    'rarity_percent': rarity,
+                }
+            )
+            achievement_obj.difficulty_score = achievement_obj.calculate_difficulty()
+            achievement_obj.save()
+
+            result.append({
+                "name": achievement_obj.display_name,
+                "description": achievement_obj.description,
+                "icon": ach.get("icon"),
+                "rarity": round(rarity, 1),
+                "difficulty_score": achievement_obj.difficulty_score
+            })
+            
+    except Exception as e:
+        print(f"Achievements error: {e}")
+
+    return render(request, 'games/achievements.html', {'game': game_instance, 'achievements': result})
+
+# Заглушки для API (чтобы старые ссылки не падали)
+def test_api(request): return requests.JsonResponse({"status": "ok"})
+def register(request): return render(request, 'games/index.html')
+def login_view(request): return render(request, 'games/index.html')
+def get_search_history(request): return render(request, 'games/index.html')
